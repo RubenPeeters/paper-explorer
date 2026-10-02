@@ -11,16 +11,16 @@ Pipeline
   5. Write out/papers.csv (one row per paper) and out/gaps.csv (one row per
      limitation / future-work / lesson / missing-resource statement).
 
-Setup
-  pip install requests anthropic pypdf
-  export ANTHROPIC_API_KEY=...
-  export CONTACT_EMAIL=you@university.be        # polite-pool for DBLP/OpenAlex
-  export OPENALEX_API_KEY=...                   # only if OpenAlex asks for one
+Setup (uv; PowerShell syntax shown, use `export VAR=...` in bash)
+  uv sync
+  $env:ANTHROPIC_API_KEY = "..."
+  $env:CONTACT_EMAIL = "you@university.be"      # polite-pool for DBLP/OpenAlex
+  $env:OPENALEX_API_KEY = "..."                 # only if OpenAlex asks for one
 
 Usage
-  python gap_miner.py --limit 10                # small trial run first
-  python gap_miner.py --venues ISWC ESWC --years 2022-2026
-  python gap_miner.py --list-only               # only test the DBLP listing
+  uv run gap_miner.py --limit 10                # small trial run first
+  uv run gap_miner.py --venues ISWC ESWC --years 2022-2026
+  uv run gap_miner.py --list-only               # only test the DBLP listing
 
 Runs are resumable: finished papers are cached in out/papers.jsonl.
 """
