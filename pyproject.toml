@@ -1,0 +1,9 @@
+[project]
+name = "paper-explorer"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=1.11.0",
+    "pypdf>=6.19.0",
+    "requests>=2.34.2",
+]
