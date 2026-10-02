@@ -275,7 +275,7 @@ def pdf_to_text(data):
         return None
 
 
-def fetch_pdf_text(session, url):
+def fetch_pdf(session, url):
     try:
         r = get(session, url, tries=2, stream=True)
         data = r.raw.read(MAX_PDF_BYTES + 1, decode_content=True)
@@ -283,7 +283,7 @@ def fetch_pdf_text(session, url):
         return None
     if len(data) > MAX_PDF_BYTES or not data.startswith(b"%PDF"):
         return None
-    return pdf_to_text(data)
+    return data
 
 
 def select_text(full):
@@ -296,8 +296,8 @@ def select_text(full):
     return body[:HEAD_CHARS] + "\n[... middle of paper omitted ...]\n" + body[-TAIL_CHARS:]
 
 
-def springer_pdf_text(session, doi):
-    """Like fetch_pdf_text, but says why it failed: access problems are
+def fetch_springer_pdf(session, doi):
+    """Like fetch_pdf, but says why it failed: access problems are
     expected here (expired cookie, chapter not in the subscription)."""
     headers = {"Cookie": SPRINGER_COOKIE} if SPRINGER_COOKIE else {}
     try:
@@ -311,18 +311,29 @@ def springer_pdf_text(session, doi):
         print(f"    Springer {doi}: no PDF (HTTP {r.status_code}, "
               f"{r.headers.get('Content-Type')}, ended at {r.url})", file=sys.stderr)
         return None
-    return pdf_to_text(r.content)
+    return r.content
 
 
-def paper_text(session, paper, use_fulltext, use_springer=False):
+def paper_text(session, paper, use_fulltext, pdf_dir, use_springer=False):
+    """Text for the LLM. PDFs that yield usable text are kept in pdf_dir and
+    reused on later runs."""
     if use_fulltext:
-        full = None
-        if paper.get("pdf_url"):
-            full = fetch_pdf_text(session, paper["pdf_url"])
+        def usable(text):
+            return text and len(text) > 3000
+
+        pdf_path = pdf_dir / file_name(paper["id"], ".pdf")
+        data = pdf_path.read_bytes() if pdf_path.exists() else None
+        if data is None and paper.get("pdf_url"):
+            data = fetch_pdf(session, paper["pdf_url"])
+        full = pdf_to_text(data) if data else None
         doi = paper.get("doi") or ""
-        if use_springer and doi.startswith("10.1007/") and not (full and len(full) > 3000):
-            full = springer_pdf_text(session, doi)
-        if full and len(full) > 3000:
+        if use_springer and doi.startswith("10.1007/") and not usable(full):
+            data = fetch_springer_pdf(session, doi)
+            full = pdf_to_text(data) if data else None
+        if usable(full):
+            if not pdf_path.exists():
+                pdf_dir.mkdir(exist_ok=True)
+                pdf_path.write_bytes(data)
             return select_text(full), "fulltext"
     if paper.get("abstract"):
         return paper["abstract"], "abstract"
@@ -404,8 +415,8 @@ def extract(client, paper, text, source):
 # with the JSON object in out/extractions/<name>.json, and --collect merges
 # the answers into the cache.
 
-def file_name(paper_id):
-    return re.sub(r"[^\w.-]", "_", paper_id) + ".json"
+def file_name(paper_id, ext=".json"):
+    return re.sub(r"[^\w.-]", "_", paper_id) + ext
 
 
 def write_pending(pending_dir, paper, text, source):
@@ -599,7 +610,7 @@ def main():
         with cache_path.open("a", encoding="utf-8") as cache:
             for n, p in enumerate(todo, 1):
                 text, source = paper_text(session, p, not args.no_fulltext,
-                                          args.springer)
+                                          out_dir / "pdfs", args.springer)
                 p["text_source"] = source
                 p.pop("abstract", None)
                 print(f"  [{n}/{len(todo)}] {source:8} {p['title'][:70]}")
