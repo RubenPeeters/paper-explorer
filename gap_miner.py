@@ -22,6 +22,12 @@ Usage
   uv run gap_miner.py --venues ISWC ESWC --years 2022-2026
   uv run gap_miner.py --list-only               # only test the DBLP listing
 
+Without an API key (e.g. let a Claude Code session do step 4)
+  uv run gap_miner.py --prepare --limit 10      # prompts -> out/pending/
+  # answer each out/pending/<name>.json with the JSON object in
+  # out/extractions/<name>.json
+  uv run gap_miner.py --collect                 # merge answers, write CSVs
+
 Runs are resumable: finished papers are cached in out/papers.jsonl.
 """
 
@@ -337,10 +343,14 @@ def parse_json(text):
     return json.loads(text[start:end + 1])
 
 
+def build_prompt(paper, text, source):
+    return PROMPT.format(interests=INTERESTS, title=paper["title"],
+                         venue=paper["venue"], year=paper["year"],
+                         source=source, text=text)
+
+
 def extract(client, paper, text, source):
-    prompt = PROMPT.format(interests=INTERESTS, title=paper["title"],
-                           venue=paper["venue"], year=paper["year"],
-                           source=source, text=text)
+    prompt = build_prompt(paper, text, source)
     last_error = None
     for _ in range(2):
         try:
@@ -354,6 +364,47 @@ def extract(client, paper, text, source):
             time.sleep(3)
     print(f"    extraction failed: {last_error}", file=sys.stderr)
     return None
+
+# Offline alternative to extract(): --prepare writes one prompt per paper to
+# out/pending/<name>.json, someone (e.g. a Claude Code session) answers each
+# with the JSON object in out/extractions/<name>.json, and --collect merges
+# the answers into the cache.
+
+def file_name(paper_id):
+    return re.sub(r"[^\w.-]", "_", paper_id) + ".json"
+
+
+def write_pending(pending_dir, paper, text, source):
+    pending_dir.mkdir(exist_ok=True)
+    rec = {"paper": paper, "system": SYSTEM,
+           "prompt": build_prompt(paper, text, source)}
+    (pending_dir / file_name(paper["id"])).write_text(
+        json.dumps(rec, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def collect(out_dir, done, cache):
+    pending_dir, answers_dir = out_dir / "pending", out_dir / "extractions"
+    collected, waiting = 0, 0
+    for f in sorted(pending_dir.glob("*.json")):
+        answer = answers_dir / f.name
+        if not answer.exists():
+            waiting += 1
+            continue
+        try:
+            extraction = parse_json(answer.read_text(encoding="utf-8"))
+        except ValueError as e:
+            print(f"  {answer.name}: bad JSON ({e}); left pending", file=sys.stderr)
+            waiting += 1
+            continue
+        p = json.loads(f.read_text(encoding="utf-8"))["paper"]
+        p["extraction"] = extraction
+        cache.write(json.dumps(p, ensure_ascii=False) + "\n")
+        cache.flush()
+        done[p["id"]] = p
+        f.unlink()
+        answer.unlink()
+        collected += 1
+    print(f"Collected {collected} extractions, {waiting} still pending")
 
 # --------------------------------------------------------------------------
 # Step 5: output
@@ -419,6 +470,13 @@ def write_csvs(records, out_dir):
                              "statement": g.get("statement"),
                              "quote": g.get("quote")})
 
+
+def write_outputs(done, out_dir):
+    write_csvs(list(done.values()), out_dir)
+    sources = Counter(r.get("text_source") for r in done.values())
+    print(f"Wrote {out_dir/'papers.csv'} and {out_dir/'gaps.csv'}")
+    print("Text used: " + ", ".join(f"{k}: {v}" for k, v in sources.items()))
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
@@ -440,12 +498,24 @@ def main():
     ap.add_argument("--no-fulltext", action="store_true", help="abstracts only")
     ap.add_argument("--list-only", action="store_true",
                     help="list papers from DBLP and stop (no LLM calls)")
+    ap.add_argument("--prepare", action="store_true",
+                    help="write prompts to OUT/pending/ instead of calling the API")
+    ap.add_argument("--collect", action="store_true",
+                    help="merge answers from OUT/extractions/ and write the CSVs")
     args = ap.parse_args()
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     cache_path = out_dir / "papers.jsonl"
+    pending_dir = out_dir / "pending"
     session = make_session()
+
+    if args.collect:
+        done = load_cache(cache_path)
+        with cache_path.open("a", encoding="utf-8") as cache:
+            collect(out_dir, done, cache)
+        write_outputs(done, out_dir)
+        return
 
     print("Listing papers from DBLP")
     papers = {}
@@ -464,14 +534,17 @@ def main():
         return
 
     done = load_cache(cache_path)
-    todo = [p for pid, p in papers.items() if pid not in done]
+    pending = {f.name for f in pending_dir.glob("*.json")}
+    todo = [p for pid, p in papers.items()
+            if pid not in done and file_name(pid) not in pending]
     if args.limit:
         todo = todo[:args.limit]
-    print(f"{len(done)} cached, {len(todo)} to process")
+    print(f"{len(done)} cached, {len(pending)} pending, {len(todo)} to process")
 
     if todo:
-        import anthropic
-        client = anthropic.Anthropic()
+        if not args.prepare:
+            import anthropic
+            client = anthropic.Anthropic()
         print("Fetching abstracts and PDF links from OpenAlex")
         enrich(session, todo)
 
@@ -479,19 +552,19 @@ def main():
             for n, p in enumerate(todo, 1):
                 text, source = paper_text(session, p, not args.no_fulltext)
                 p["text_source"] = source
-                p["extraction"] = extract(client, p, text, source) if text else None
                 p.pop("abstract", None)
+                print(f"  [{n}/{len(todo)}] {source:8} {p['title'][:70]}")
+                if text and args.prepare:
+                    write_pending(pending_dir, p, text, source)
+                    continue
+                p["extraction"] = extract(client, p, text, source) if text else None
                 if text and p["extraction"] is None:
                     continue             # failed: leave uncached so it retries
                 cache.write(json.dumps(p, ensure_ascii=False) + "\n")
                 cache.flush()
                 done[p["id"]] = p
-                print(f"  [{n}/{len(todo)}] {source:8} {p['title'][:70]}")
 
-    write_csvs(list(done.values()), out_dir)
-    sources = Counter(r.get("text_source") for r in done.values())
-    print(f"Wrote {out_dir/'papers.csv'} and {out_dir/'gaps.csv'}")
-    print("Text used: " + ", ".join(f"{k}: {v}" for k, v in sources.items()))
+    write_outputs(done, out_dir)
 
 
 if __name__ == "__main__":
