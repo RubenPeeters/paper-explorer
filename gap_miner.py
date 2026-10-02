@@ -266,20 +266,24 @@ def enrich(session, papers, batch_size=40):
 # Step 3: full text (optional)
 # --------------------------------------------------------------------------
 
-def fetch_pdf_text(session, url, **kw):
+def pdf_to_text(data):
     try:
         from pypdf import PdfReader
-    except ImportError:
-        return None
-    try:
-        r = get(session, url, tries=2, stream=True, **kw)
-        data = r.raw.read(MAX_PDF_BYTES + 1, decode_content=True)
-        if len(data) > MAX_PDF_BYTES or not data.startswith(b"%PDF"):
-            return None
         reader = PdfReader(io.BytesIO(data))
         return "\n".join((page.extract_text() or "") for page in reader.pages)
     except Exception:
         return None
+
+
+def fetch_pdf_text(session, url):
+    try:
+        r = get(session, url, tries=2, stream=True)
+        data = r.raw.read(MAX_PDF_BYTES + 1, decode_content=True)
+    except Exception:
+        return None
+    if len(data) > MAX_PDF_BYTES or not data.startswith(b"%PDF"):
+        return None
+    return pdf_to_text(data)
 
 
 def select_text(full):
@@ -293,10 +297,21 @@ def select_text(full):
 
 
 def springer_pdf_text(session, doi):
+    """Like fetch_pdf_text, but says why it failed: access problems are
+    expected here (expired cookie, chapter not in the subscription)."""
     headers = {"Cookie": SPRINGER_COOKIE} if SPRINGER_COOKIE else {}
-    text = fetch_pdf_text(session, SPRINGER_PDF.format(doi=doi), headers=headers)
-    time.sleep(1)    # Springer's TDM terms: at most 1 request per second
-    return text
+    try:
+        r = get(session, SPRINGER_PDF.format(doi=doi), tries=2, headers=headers)
+    except requests.RequestException as e:
+        print(f"    Springer {doi}: {e}", file=sys.stderr)
+        return None
+    finally:
+        time.sleep(1)    # Springer's TDM terms: at most 1 request per second
+    if not r.content.startswith(b"%PDF"):
+        print(f"    Springer {doi}: no PDF (HTTP {r.status_code}, "
+              f"{r.headers.get('Content-Type')}, ended at {r.url})", file=sys.stderr)
+        return None
+    return pdf_to_text(r.content)
 
 
 def paper_text(session, paper, use_fulltext, use_springer=False):
@@ -557,8 +572,19 @@ def main():
 
     done = load_cache(cache_path)
     pending = {f.name for f in pending_dir.glob("*.json")}
-    todo = [p for pid, p in papers.items()
-            if pid not in done and file_name(pid) not in pending]
+    def needs_work(pid, p):
+        if file_name(pid) in pending:
+            return False
+        if pid not in done:
+            return True
+        # With --springer, retry Springer papers for which no text was found
+        return (args.springer and done[pid].get("text_source") == "none"
+                and (p.get("doi") or "").startswith("10.1007/"))
+
+    todo = [p for pid, p in papers.items() if needs_work(pid, p)]
+    if args.springer:
+        print("Springer access: " + ("SPRINGER_COOKIE is set" if SPRINGER_COOKIE
+                                     else "no SPRINGER_COOKIE, relying on campus IP"))
     if args.limit:
         todo = todo[:args.limit]
     print(f"{len(done)} cached, {len(pending)} pending, {len(todo)} to process")
