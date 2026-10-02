@@ -149,6 +149,9 @@ def dblp_hits(session, stream, year):
         while True:
             r = get(session, DBLP_API,
                     params={"q": q, "format": "json", "h": 1000, "f": offset})
+            if "json" not in r.headers.get("Content-Type", ""):
+                sys.exit("DBLP returned a web page instead of JSON (most likely "
+                         "its bot check). Try again later or from another network.")
             res = r.json()["result"]["hits"]
             batch = as_list(res.get("hit"))
             hits.extend(h["info"] for h in batch)
