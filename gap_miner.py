@@ -76,13 +76,20 @@ MODEL = os.environ.get("GAP_MINER_MODEL", "claude-haiku-4-5-20251001")
 CONTACT = os.environ.get("CONTACT_EMAIL", "")
 OPENALEX_KEY = os.environ.get("OPENALEX_API_KEY", "")
 
-DBLP_API = "https://dblp.org/search/publ/api"
-# DBLP has used both spellings of the stream filter; the first that returns
-# hits is used.
-DBLP_QUERY_TEMPLATES = [
-    "stream:streams/{stream}: year:{year}:",
-    "streamid:{stream}: year:{year}:",
-]
+# DBLP's SPARQL endpoint; the search API (dblp.org/search) sits behind a bot
+# check that blocks scripts.
+DBLP_SPARQL = "https://sparql.dblp.org/sparql"
+DBLP_QUERY = """\
+PREFIX dblp: <https://dblp.org/rdf/schema#>
+SELECT ?pub ?title ?venue ?doi ?ee WHERE {{
+  ?pub a dblp:Inproceedings ;
+       dblp:publishedInStream <https://dblp.org/streams/{stream}> ;
+       dblp:yearOfPublication "{year}"^^<http://www.w3.org/2001/XMLSchema#gYear> ;
+       dblp:title ?title .
+  OPTIONAL {{ ?pub dblp:publishedIn ?venue }}
+  OPTIONAL {{ ?pub dblp:doi ?doi }}
+  OPTIONAL {{ ?pub dblp:primaryDocumentPage ?ee }}
+}}"""
 OPENALEX_API = "https://api.openalex.org/works"
 
 HEAD_CHARS = 4000     # start of paper: abstract + introduction
@@ -143,26 +150,25 @@ def extract_doi(info):
 
 
 def dblp_hits(session, stream, year):
-    for tmpl in DBLP_QUERY_TEMPLATES:
-        q = tmpl.format(stream=stream, year=year)
-        hits, offset = [], 0
-        while True:
-            r = get(session, DBLP_API,
-                    params={"q": q, "format": "json", "h": 1000, "f": offset})
-            if "json" not in r.headers.get("Content-Type", ""):
-                sys.exit("DBLP returned a web page instead of JSON (most likely "
-                         "its bot check). Try again later or from another network.")
-            res = r.json()["result"]["hits"]
-            batch = as_list(res.get("hit"))
-            hits.extend(h["info"] for h in batch)
-            offset += len(batch)
-            if not batch or offset >= int(res.get("@total", 0)):
-                break
-            time.sleep(1)
-        if hits:
-            return hits
-        time.sleep(1)
-    return []
+    """Conference papers in a DBLP stream and publication year.
+
+    Returns one dict per paper with key, title, venue (list), doi, ee (list).
+    """
+    r = get(session, DBLP_SPARQL,
+            params={"query": DBLP_QUERY.format(stream=stream, year=year)},
+            headers={"Accept": "application/sparql-results+json"})
+    hits = {}
+    for b in r.json()["results"]["bindings"]:
+        key = b["pub"]["value"].removeprefix("https://dblp.org/rec/")
+        info = hits.setdefault(key, {"key": key, "title": b["title"]["value"],
+                                     "venue": [], "doi": None, "ee": []})
+        if "venue" in b and b["venue"]["value"] not in info["venue"]:
+            info["venue"].append(b["venue"]["value"])
+        if "doi" in b:
+            info["doi"] = b["doi"]["value"].removeprefix("https://doi.org/")
+        if "ee" in b and b["ee"]["value"] not in info["ee"]:
+            info["ee"].append(b["ee"]["value"])
+    return list(hits.values())
 
 
 def list_papers(session, venue, year):
@@ -172,10 +178,6 @@ def list_papers(session, venue, year):
     papers, dropped_venues, dropped_kw = [], Counter(), 0
 
     for info in dblp_hits(session, cfg["stream"], year):
-        if str(info.get("year")) != str(year):
-            continue
-        if info.get("type") != "Conference and Workshop Papers":
-            continue
         venue_strings = as_list(info.get("venue"))
         if not any(rx.match(v) for v in venue_strings):
             dropped_venues[" / ".join(venue_strings)] += 1
@@ -192,7 +194,7 @@ def list_papers(session, venue, year):
             "year": int(year),
             "title": title,
             "doi": extract_doi(info),
-            "url": ees[0] if ees else info.get("url"),
+            "url": ees[0] if ees else f"https://dblp.org/rec/{info['key']}",
         })
 
     msg = f"  {venue} {year}: kept {len(papers)}"
@@ -457,7 +459,7 @@ def main():
         sys.exit(f"Could not reach DBLP ({e}). Try again later or from another network.")
     print(f"Total: {len(papers)} papers")
     if not papers:
-        sys.exit("Nothing found. Check DBLP_QUERY_TEMPLATES and the venue regexes.")
+        sys.exit("Nothing found. Check DBLP_QUERY and the venue regexes.")
     if args.list_only:
         return
 
