@@ -447,11 +447,14 @@ def main():
 
     print("Listing papers from DBLP")
     papers = {}
-    for venue in args.venues:
-        for year in parse_years(args.years):
-            for p in list_papers(session, venue, year):
-                papers[p["id"]] = p
-            time.sleep(1)
+    try:
+        for venue in args.venues:
+            for year in parse_years(args.years):
+                for p in list_papers(session, venue, year):
+                    papers[p["id"]] = p
+                time.sleep(1)
+    except requests.RequestException as e:
+        sys.exit(f"Could not reach DBLP ({e}). Try again later or from another network.")
     print(f"Total: {len(papers)} papers")
     if not papers:
         sys.exit("Nothing found. Check DBLP_QUERY_TEMPLATES and the venue regexes.")
