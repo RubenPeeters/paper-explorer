@@ -16,6 +16,9 @@ Setup (uv; PowerShell syntax shown, use `export VAR=...` in bash)
   $env:ANTHROPIC_API_KEY = "..."
   $env:CONTACT_EMAIL = "you@university.be"      # polite-pool for DBLP/OpenAlex
   $env:OPENALEX_API_KEY = "..."                 # only if OpenAlex asks for one
+  $env:SPRINGER_COOKIE = "..."                  # for --springer off campus: Cookie
+                                                # header of a logged-in
+                                                # link.springer.com session
 
 Usage
   uv run gap_miner.py --limit 10                # small trial run first
@@ -81,6 +84,10 @@ INTERESTS = """\
 MODEL = os.environ.get("GAP_MINER_MODEL", "claude-haiku-4-5-20251001")
 CONTACT = os.environ.get("CONTACT_EMAIL", "")
 OPENALEX_KEY = os.environ.get("OPENALEX_API_KEY", "")
+# Cookie header of a logged-in link.springer.com session (institutional
+# access); not needed on a campus network with IP-based access.
+SPRINGER_COOKIE = os.environ.get("SPRINGER_COOKIE", "")
+SPRINGER_PDF = "https://link.springer.com/content/pdf/{doi}.pdf"
 
 # DBLP's SPARQL endpoint; the search API (dblp.org/search) sits behind a bot
 # check that blocks scripts.
@@ -259,13 +266,13 @@ def enrich(session, papers, batch_size=40):
 # Step 3: full text (optional)
 # --------------------------------------------------------------------------
 
-def fetch_pdf_text(session, url):
+def fetch_pdf_text(session, url, **kw):
     try:
         from pypdf import PdfReader
     except ImportError:
         return None
     try:
-        r = get(session, url, tries=2, stream=True)
+        r = get(session, url, tries=2, stream=True, **kw)
         data = r.raw.read(MAX_PDF_BYTES + 1, decode_content=True)
         if len(data) > MAX_PDF_BYTES or not data.startswith(b"%PDF"):
             return None
@@ -285,9 +292,21 @@ def select_text(full):
     return body[:HEAD_CHARS] + "\n[... middle of paper omitted ...]\n" + body[-TAIL_CHARS:]
 
 
-def paper_text(session, paper, use_fulltext):
-    if use_fulltext and paper.get("pdf_url"):
-        full = fetch_pdf_text(session, paper["pdf_url"])
+def springer_pdf_text(session, doi):
+    headers = {"Cookie": SPRINGER_COOKIE} if SPRINGER_COOKIE else {}
+    text = fetch_pdf_text(session, SPRINGER_PDF.format(doi=doi), headers=headers)
+    time.sleep(1)    # Springer's TDM terms: at most 1 request per second
+    return text
+
+
+def paper_text(session, paper, use_fulltext, use_springer=False):
+    if use_fulltext:
+        full = None
+        if paper.get("pdf_url"):
+            full = fetch_pdf_text(session, paper["pdf_url"])
+        doi = paper.get("doi") or ""
+        if use_springer and doi.startswith("10.1007/") and not (full and len(full) > 3000):
+            full = springer_pdf_text(session, doi)
         if full and len(full) > 3000:
             return select_text(full), "fulltext"
     if paper.get("abstract"):
@@ -498,6 +517,9 @@ def main():
     ap.add_argument("--no-fulltext", action="store_true", help="abstracts only")
     ap.add_argument("--list-only", action="store_true",
                     help="list papers from DBLP and stop (no LLM calls)")
+    ap.add_argument("--springer", action="store_true",
+                    help="fetch Springer PDFs via institutional access "
+                         "(campus IP or SPRINGER_COOKIE), 1 request/s")
     ap.add_argument("--prepare", action="store_true",
                     help="write prompts to OUT/pending/ instead of calling the API")
     ap.add_argument("--collect", action="store_true",
@@ -550,7 +572,8 @@ def main():
 
         with cache_path.open("a", encoding="utf-8") as cache:
             for n, p in enumerate(todo, 1):
-                text, source = paper_text(session, p, not args.no_fulltext)
+                text, source = paper_text(session, p, not args.no_fulltext,
+                                          args.springer)
                 p["text_source"] = source
                 p.pop("abstract", None)
                 print(f"  [{n}/{len(todo)}] {source:8} {p['title'][:70]}")
